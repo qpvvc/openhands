@@ -219,3 +219,5 @@ workspace/
 # Evaluation outputs
 eval_outputs/
 builds/
+uv.lock
+benchmarks/swegym/hostfile
