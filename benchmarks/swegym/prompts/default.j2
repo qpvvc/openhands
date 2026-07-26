@@ -1,0 +1,15 @@
+I have access to a code repository in {{ instance.repo_path }}. Use the available
+terminal tool to inspect and modify it. Every terminal call starts in
+{{ instance.repo_path }}, so combine directory or environment activation with the
+command that needs it.
+
+Resolve the following issue:
+
+<issue_description>
+{{ instance.problem_statement }}
+</issue_description>
+
+Make the smallest correct change to non-test source files. The task environment and
+evaluation tests are already prepared; do not modify tests or install dependencies.
+Inspect the relevant code, implement the fix, run focused existing tests when useful,
+and finish after reviewing the diff against {{ instance.base_commit }}.

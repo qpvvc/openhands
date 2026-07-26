@@ -42,6 +42,7 @@ dependencies = [
     "lmnr>=0.7.24",
     "multi-swe-bench>=1.1.1",
     "omegaconf",
+    "opensandbox",
 ]
 
 [project.scripts]
@@ -59,6 +60,8 @@ multiswebench-eval = "benchmarks.multiswebench.eval_infer:main"
 openagentsafety-infer = "benchmarks.openagentsafety.run_infer:main"
 swebenchmultimodal-infer = "benchmarks.swebenchmultimodal.run_infer:main"
 swebenchmultimodal-eval = "benchmarks.swebenchmultimodal.eval_infer:main"
+swegym-infer = "benchmarks.swegym.run_infer:main"
+swegym-score = "benchmarks.swegym.score:main"
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
