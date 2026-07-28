@@ -34,6 +34,26 @@ def test_normalize_rejects_raw_row() -> None:
         normalize_row({"instance_id": "org__repo-1", "problem_statement": "x"})
 
 
+def test_normalize_scale_swe_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SCALE_SWE_IMAGE_PREFIX", "registry.test")
+    data = normalize_row(
+        {
+            "prompt": "fix it",
+            "label": "owner_repo_pr1",
+            "metadata": {
+                "_slime_dataset": "scale_swe",
+                "image_url": "aweaiteam/scaleswe:owner_repo_pr1",
+                "workdir": "/workspace/repo",
+                "f2p_patch": "diff --git a/test.py b/test.py\n",
+                "FAIL_TO_PASS": '["test.py::test_fix"]',
+                "PASS_TO_PASS": [],
+            },
+        }
+    )
+    assert data["dataset_kind"] == "scale_swe"
+    assert data["image"] == "registry.test/aweaiteam/scaleswe:owner_repo_pr1"
+
+
 def test_score_file(tmp_path: Path) -> None:
     output = tmp_path / "output.jsonl"
     output.write_text(

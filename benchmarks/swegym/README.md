@@ -168,20 +168,76 @@ For an eight-node Ray cluster, `launch_sglang_cluster.py` reserves all eight
 GPUs on each node and starts one independent TP8 replica per node. It writes one
 LLM config per worker so the eight rollout rounds can connect directly to the
 eight replicas without a router version dependency. Four workers per round
-give each replica four concurrent requests while all 64 samples run together:
+give each replica four concurrent requests while all 64 samples run together.
+
+If a Ray cluster is not already running, set `WORKER_ADDR` to the comma-separated
+worker hosts, verify passwordless root SSH, then create `hostfile` and initialize
+the cluster from the benchmark root:
 
 ```bash
-python benchmarks/swegym/launch_sglang_cluster.py \
-  --model-path /path/to/Qwen3-30B-A3B-Instruct-2507 \
-  --worker-port 18080 \
-  --log-dir eval_outputs/swegym/sglang_cluster \
-  --ready-file eval_outputs/swegym/sglang_cluster/ready.json \
-  --llm-config-template benchmarks/swegym/configs/sglang-cluster-eval.json
+cd /mnt/zj-data/data/dongjie/OpenHands/benchmarks
+bash benchmarks/swegym/generate_hostfile.sh
+bash benchmarks/swegym/setup_env.sh
+ray status
+```
 
-LLM_CONFIGS="$(printf '%s,' eval_outputs/swegym/sglang_cluster/configs/*.json)" \
-PARALLEL_ROUNDS=8 NUM_WORKERS=4 \
+`setup_env.sh` stops existing Ray, SGLang, Slime, and Megatron processes on the
+listed nodes. Do not run it while another job is using the cluster.
+
+The following is the validated persistent launch for eight Qwen3-Coder TP8
+replicas. Absolute paths keep the controller log, generated configs, and
+`ready.json` in the same directory even though tmux starts a new shell:
+
+```bash
+BENCHMARKS_ROOT=/mnt/zj-data/data/dongjie/OpenHands/benchmarks
+CLUSTER_DIR="${BENCHMARKS_ROOT}/eval_outputs/swegym/$(date +%Y%m%d_%H%M%S)_sglang_cluster_qwen3-Coder"
+mkdir -p "$CLUSTER_DIR"
+
+tmux new-session -d -s swegym-sglang-8node \
+  "cd '${BENCHMARKS_ROOT}' && \
+   MATE_FORCE_JIT=1 python3 benchmarks/swegym/launch_sglang_cluster.py \
+     --model-path /mnt/zj-data/models/001688/rl_models/Qwen3-Coder-30B-A3B-Instruct \
+     --replicas 8 \
+     --worker-port 18080 \
+     --log-dir '${CLUSTER_DIR}' \
+     --ready-file '${CLUSTER_DIR}/ready.json' \
+     --llm-config-template benchmarks/swegym/configs/sglang-cluster-eval.json \
+     > '${CLUSTER_DIR}/controller.log' 2>&1"
+
+tail -f "$CLUSTER_DIR/controller.log"
+```
+
+After the controller reports `SGLang replicas ready`, start all eight rollout
+rounds from a persistent shell or tmux pane:
+
+```bash
+export SANDBOX_DOMAIN="10.124.120.15:30003"
+export SANDBOX_API_KEY="<your-api-key>"
+export UV_BIN="/mnt/zj-data/data/dongjie/.tools/bin/uv"
+export LLM_CONFIGS="$(
+  find "$CLUSTER_DIR/configs" -maxdepth 1 -name 'worker-*.json' \
+    | sort \
+    | paste -sd,
+)"
+
+N_ROLLOUTS=8 \
+PARALLEL_ROUNDS=8 \
+NUM_WORKERS=4 \
+CONVERSATION_TIMEOUT=3600 \
+RUN_NOTE="$(date +%Y%m%d_%H%M%S)_qwen3_coder_30b_cluster8_tp8_w4" \
 ./benchmarks/swegym/start_eval.sh
 ```
+
+When evaluation is complete, stop only the SGLang controller session to release
+the 64 GPUs:
+
+```bash
+tmux kill-session -t swegym-sglang-8node
+```
+
+The current cluster launcher uses `--tool-call-parser qwen3_coder`, matching the
+Qwen3-Coder model above. Use the parser that matches the selected model's chat
+template when changing model families.
 
 On mthreads-gmi, avoid ports in Kubernetes' NodePort range (normally
 `30000-32767`) for addresses advertised through the Ray node IP. A server can
@@ -191,9 +247,8 @@ therefore defaults to port `18080`. It also propagates the driver's MUSA
 library environment to each Ray actor; launch it from the same prepared shell
 used for a working local SGLang server.
 
-Submit the launcher as a long-running Ray job when it should survive the
-terminal session. Stop only that job after evaluation to release its 64 GPUs;
-the Ray cluster itself can remain running.
+Keep the tmux controller session alive for the duration of the evaluation. The
+Ray cluster itself can remain running after that session is stopped.
 
 ### Score results
 

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 import json
 import os
+import shlex
 import signal
 from contextlib import contextmanager
 from pathlib import Path
@@ -39,6 +41,36 @@ DEFAULT_DATASET = (
     Path(__file__).resolve().parents[4]
     / "data/SWE-Gym/processed/swe_gym_8unique_easy_osb.jsonl"
 )
+_SCALE_SWE_RUNNER = r'''import json
+import sys
+
+import pytest
+
+with open(sys.argv[1], encoding="utf-8") as stream:
+    test_ids = json.load(stream)["test_ids"]
+sys.path.insert(0, ".")
+raise SystemExit(pytest.main(["-q", "--tb=short", "--no-header", "-o", "addopts=", "--rootdir=.", *test_ids]))
+'''
+
+
+def _shell_write_text(path: str, content: str) -> str:
+    """Return a shell command that writes arbitrary UTF-8 content safely."""
+    encoded = base64.b64encode(content.encode()).decode()
+    return f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(path)}"
+
+
+def _scale_swe_test_ids(data: dict[str, Any]) -> list[str]:
+    result: list[str] = []
+    for key in ("FAIL_TO_PASS", "PASS_TO_PASS"):
+        value = data.get(key)
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except json.JSONDecodeError:
+                value = [value]
+        if isinstance(value, list):
+            result.extend(str(item) for item in value if str(item).strip())
+    return result
 
 
 class ConversationWallClockTimeoutError(BaseException):
@@ -75,6 +107,23 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
         data.setdefault("problem_statement", row.get("prompt"))
     else:
         data = dict(row)
+
+    if data.get("_slime_dataset") == "scale_swe":
+        image = str(data.get("image") or data.get("image_url") or "")
+        prefix = os.getenv("SCALE_SWE_IMAGE_PREFIX", "").rstrip("/")
+        if prefix and image and not image.startswith(f"{prefix}/"):
+            image = f"{prefix}/{image.lstrip('/')}"
+        data["image"] = image
+        data.setdefault("problem_statement", row.get("prompt"))
+        data.setdefault("instance_id", row.get("label"))
+        required = {"instance_id", "image", "workdir", "problem_statement", "f2p_patch"}
+        missing = sorted(key for key in required if not data.get(key))
+        if not _scale_swe_test_ids(data):
+            missing.append("FAIL_TO_PASS/PASS_TO_PASS")
+        if missing:
+            raise ValueError(f"Scale-SWE row is missing executable metadata {missing}")
+        data["dataset_kind"] = "scale_swe"
+        return data
 
     required = {
         "instance_id",
@@ -145,7 +194,7 @@ class SWEGymEvaluation(Evaluation):
             lifetime=self.sandbox_lifetime,
         )
         setup = workspace.execute_command(
-            str(instance.data["pre_commands"]), timeout=self.setup_timeout
+            str(instance.data.get("pre_commands") or "true"), timeout=self.setup_timeout
         )
         if setup.exit_code != 0:
             workspace.__exit__(None, None, None)
@@ -153,7 +202,58 @@ class SWEGymEvaluation(Evaluation):
                 f"pre_commands failed with exit code {setup.exit_code}: "
                 f"{setup.stderr or setup.stdout}"
             )
+        if instance.data.get("dataset_kind") == "scale_swe":
+            self._prepare_scale_swe_workspace(workspace, instance)
         return workspace  # type: ignore[return-value]
+
+    def _prepare_scale_swe_workspace(self, workspace: OpenSandboxWorkspace, instance: EvalInstance) -> None:
+        problem = str(instance.data["problem_statement"])
+        command = " && ".join(
+            [
+                _shell_write_text(f"{instance.data['workdir']}/PROBLEM_STATEMENT.md", problem),
+                "git config user.email 'openhands-eval@example.test'",
+                "git config user.name 'OpenHands Eval'",
+            ]
+        )
+        setup = workspace.execute_command(command, timeout=self.setup_timeout)
+        if setup.exit_code != 0:
+            raise RuntimeError(f"Scale-SWE setup failed: {setup.stderr or setup.stdout}")
+
+    def _evaluate_scale_swe_patch(self, instance: EvalInstance, git_patch: str) -> dict[str, Any]:
+        """Grade on a clean sandbox, matching Slime's Scale-SWE F2P/P2P contract."""
+        data = instance.data
+        workdir = str(data["workdir"])
+        with OpenSandboxWorkspace(str(data["image"]), workdir, self.sandbox_lifetime) as evaluator:
+            pre = evaluator.execute_command(str(data.get("pre_commands") or "true"), timeout=self.setup_timeout)
+            if pre.exit_code != 0:
+                return {"resolved": False, "reason": "evaluator_setup_failed", "stderr": pre.stderr[-4000:]}
+            files = [
+                ("/tmp/openhands_candidate.patch", git_patch),
+                ("/tmp/openhands_f2p.patch", str(data.get("f2p_patch") or "")),
+                ("/tmp/openhands_scale_swe_tests.json", json.dumps({"test_ids": _scale_swe_test_ids(data)})),
+                ("/tmp/openhands_scale_swe_pytest.py", _SCALE_SWE_RUNNER),
+            ]
+            write = " && ".join(_shell_write_text(path, content) for path, content in files)
+            candidate_apply = (
+                "true"
+                if not git_patch.strip()
+                else "git apply --3way --whitespace=nowarn /tmp/openhands_candidate.patch"
+            )
+            apply = (
+                f"{write} && {candidate_apply} "
+                f"&& git apply --check --whitespace=nowarn /tmp/openhands_f2p.patch "
+                f"&& git apply --whitespace=nowarn /tmp/openhands_f2p.patch "
+                "&& python /tmp/openhands_scale_swe_pytest.py /tmp/openhands_scale_swe_tests.json"
+            )
+            result = evaluator.execute_command(apply, timeout=self.eval_timeout)
+            return {
+                "resolved": result.exit_code == 0,
+                "grader": "scale_swe",
+                "eval_exit_code": result.exit_code,
+                "eval_stdout": result.stdout[-4000:],
+                "eval_stderr": result.stderr[-4000:],
+                "timed_out": result.timeout_occurred,
+            }
 
     def _capture_conversation_archive(
         self, workspace: RemoteWorkspace, instance: EvalInstance
@@ -208,22 +308,33 @@ class SWEGymEvaluation(Evaluation):
                 instance.id,
             )
 
-        base_commit = str(instance.data["base_commit"])
+        base_commit = str(instance.data.get("base_commit") or "HEAD")
         patch_result = workspace.execute_command(
-            "git add -A -- . ':(exclude).swe_eval/**' && "
+            "git add -A -- . ':(exclude).swe_eval/**' ':(exclude)PROBLEM_STATEMENT.md' && "
             f"git --no-pager diff --cached --no-color {base_commit} -- . "
-            "':(exclude).swe_eval/**'",
+            "':(exclude).swe_eval/**' ':(exclude)PROBLEM_STATEMENT.md'",
             timeout=120,
         )
         if patch_result.exit_code != 0:
             raise RuntimeError(f"git diff failed: {patch_result.stderr}")
         git_patch = patch_result.stdout
 
-        eval_timeout = int(instance.data.get("eval_timeout_sec") or self.eval_timeout)
-        eval_result = workspace.execute_command(
-            str(instance.data["eval_cmd"]), timeout=eval_timeout
-        )
-        resolved = eval_result.exit_code == 0
+        if instance.data.get("dataset_kind") == "scale_swe":
+            test_result = self._evaluate_scale_swe_patch(instance, git_patch)
+            resolved = bool(test_result["resolved"])
+        else:
+            eval_timeout = int(instance.data.get("eval_timeout_sec") or self.eval_timeout)
+            eval_result = workspace.execute_command(
+                str(instance.data["eval_cmd"]), timeout=eval_timeout
+            )
+            resolved = eval_result.exit_code == 0
+            test_result = {
+                "git_patch": git_patch,
+                "resolved": resolved,
+                "eval_exit_code": eval_result.exit_code,
+                "eval_stdout": eval_result.stdout,
+                "eval_stderr": eval_result.stderr,
+            }
         logger.info(
             "SWE-Gym result %s: resolved=%s exit_code=%s",
             instance.id,
@@ -260,13 +371,7 @@ class SWEGymEvaluation(Evaluation):
                     "messages": messages,
                     "model": self.metadata.llm.model,
                     "tools": tools_list,
-                    "test_result": {
-                        "git_patch": git_patch,
-                        "resolved": resolved,
-                        "eval_exit_code": eval_result.exit_code,
-                        "eval_stdout": eval_result.stdout,
-                        "eval_stderr": eval_result.stderr,
-                    },
+                    "test_result": {"git_patch": git_patch, **test_result},
                 },
                 indent=2,
             )
@@ -275,13 +380,7 @@ class SWEGymEvaluation(Evaluation):
         return EvalOutput(
             instance_id=instance.id,
             attempt=self.current_attempt,
-            test_result={
-                "git_patch": git_patch,
-                "resolved": resolved,
-                "eval_exit_code": eval_result.exit_code,
-                "eval_stdout": eval_result.stdout,
-                "eval_stderr": eval_result.stderr,
-            },
+            test_result={"git_patch": git_patch, **test_result},
             instruction=instruction,
             error=None,
             history=list(conversation.state.events),
