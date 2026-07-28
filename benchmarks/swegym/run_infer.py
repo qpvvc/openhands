@@ -3,6 +3,7 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
 import shlex
 import signal
 from contextlib import contextmanager
@@ -11,6 +12,7 @@ from typing import Any, Iterator, List
 
 from jinja2 import Environment, FileSystemLoader
 from omegaconf import OmegaConf
+import pandas as pd
 from pydantic import Field
 
 from benchmarks.swegym.opensandbox_workspace import (
@@ -20,7 +22,7 @@ from benchmarks.swegym.opensandbox_workspace import (
 from benchmarks.utils.args_parser import get_parser
 from benchmarks.utils.conversation import build_event_persistence_callback
 from benchmarks.utils.critics import create_critic
-from benchmarks.utils.dataset import get_dataset
+from benchmarks.utils.dataset import get_dataset, prepare_dataset
 from benchmarks.utils.evaluation import Evaluation
 from benchmarks.utils.evaluation_utils import (
     construct_eval_output_dir,
@@ -116,8 +118,11 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
         data["image"] = image
         data.setdefault("problem_statement", row.get("prompt"))
         data.setdefault("instance_id", row.get("label"))
-        required = {"instance_id", "image", "workdir", "problem_statement", "f2p_patch"}
+
+        required = {"instance_id", "image", "workdir", "problem_statement"}
         missing = sorted(key for key in required if not data.get(key))
+        if not (data.get("f2p_patch") or data.get("f2p_script")):
+            missing.append("f2p_patch/f2p_script")
         if not _scale_swe_test_ids(data):
             missing.append("FAIL_TO_PASS/PASS_TO_PASS")
         if missing:
@@ -162,21 +167,67 @@ def get_instruction(
     return template.render(context)
 
 
+def _sanitize_pre_commands(pre_commands: str | None) -> str:
+    if not pre_commands:
+        return "true"
+
+    sanitized = pre_commands
+    sanitized = sanitized.replace("\\n", "\n")
+    sanitized = sanitized.replace("\\r", "\r")
+    return re.sub(
+        r"(git\s+gc\b[^;\n&|]*?)\s+--aggressive\b", r"\1", sanitized
+    )
+
+
+def _pre_commands_for(data: dict[str, Any]) -> str:
+    commands = str(data.get("pre_commands") or "true")
+    if data.get("dataset_kind") == "scale_swe":
+        return _sanitize_pre_commands(commands)
+    return commands
+
+
+def _scale_swe_evaluator_files(
+    data: dict[str, Any], git_patch: str
+) -> list[tuple[str, str]]:
+    files = [
+        ("/tmp/openhands_candidate.patch", git_patch),
+        ("/tmp/openhands_f2p.patch", str(data.get("f2p_patch") or "")),
+        (
+            "/tmp/openhands_scale_swe_tests.json",
+            json.dumps({"test_ids": _scale_swe_test_ids(data)}),
+        ),
+        ("/tmp/openhands_scale_swe_pytest.py", _SCALE_SWE_RUNNER),
+    ]
+    if data.get("f2p_script"):
+        files.append(
+            (f"{data['workdir']}/test_fail_to_pass.py", str(data["f2p_script"]))
+        )
+    return files
+
+
 class SWEGymEvaluation(Evaluation):
     setup_timeout: int = Field(default=1200, ge=1)
     eval_timeout: int = Field(default=900, ge=1)
     sandbox_lifetime: int = Field(default=3600, ge=1)
 
     def prepare_instances(self) -> List[EvalInstance]:
-        df = get_dataset(
+        raw_df = get_dataset(
             dataset_name=self.metadata.dataset,
             split=self.metadata.dataset_split,
-            eval_limit=self.metadata.eval_limit,
-            selected_instances_file=self.metadata.selected_instances_file,
+            eval_limit=None,
+            selected_instances_file=None,
         )
-        instances = []
+        normalized_df = pd.DataFrame(
+            normalize_row(row.to_dict()) for _, row in raw_df.iterrows()
+        )
+        df = prepare_dataset(
+            normalized_df,
+            self.metadata.eval_limit,
+            self.metadata.selected_instances_file,
+        )
+        instances: list[EvalInstance] = []
         for _, row in df.iterrows():
-            data = normalize_row(row.to_dict())
+            data = row.to_dict()
             instances.append(EvalInstance(id=str(data["instance_id"]), data=data))
         logger.info("Total SWE-Gym instances to process: %d", len(instances))
         return instances
@@ -194,7 +245,7 @@ class SWEGymEvaluation(Evaluation):
             lifetime=self.sandbox_lifetime,
         )
         setup = workspace.execute_command(
-            str(instance.data.get("pre_commands") or "true"), timeout=self.setup_timeout
+            _pre_commands_for(instance.data), timeout=self.setup_timeout
         )
         if setup.exit_code != 0:
             workspace.__exit__(None, None, None)
@@ -224,25 +275,27 @@ class SWEGymEvaluation(Evaluation):
         data = instance.data
         workdir = str(data["workdir"])
         with OpenSandboxWorkspace(str(data["image"]), workdir, self.sandbox_lifetime) as evaluator:
-            pre = evaluator.execute_command(str(data.get("pre_commands") or "true"), timeout=self.setup_timeout)
+            pre = evaluator.execute_command(
+                _pre_commands_for(data), timeout=self.setup_timeout
+            )
             if pre.exit_code != 0:
                 return {"resolved": False, "reason": "evaluator_setup_failed", "stderr": pre.stderr[-4000:]}
-            files = [
-                ("/tmp/openhands_candidate.patch", git_patch),
-                ("/tmp/openhands_f2p.patch", str(data.get("f2p_patch") or "")),
-                ("/tmp/openhands_scale_swe_tests.json", json.dumps({"test_ids": _scale_swe_test_ids(data)})),
-                ("/tmp/openhands_scale_swe_pytest.py", _SCALE_SWE_RUNNER),
-            ]
+            files = _scale_swe_evaluator_files(data, git_patch)
             write = " && ".join(_shell_write_text(path, content) for path, content in files)
             candidate_apply = (
                 "true"
                 if not git_patch.strip()
                 else "git apply --3way --whitespace=nowarn /tmp/openhands_candidate.patch"
             )
+            f2p_apply = (
+                "true"
+                if not data.get("f2p_patch")
+                else "git apply --check --whitespace=nowarn /tmp/openhands_f2p.patch "
+                "&& git apply --whitespace=nowarn /tmp/openhands_f2p.patch"
+            )
             apply = (
                 f"{write} && {candidate_apply} "
-                f"&& git apply --check --whitespace=nowarn /tmp/openhands_f2p.patch "
-                f"&& git apply --whitespace=nowarn /tmp/openhands_f2p.patch "
+                f"&& {f2p_apply} "
                 "&& python /tmp/openhands_scale_swe_pytest.py /tmp/openhands_scale_swe_tests.json"
             )
             result = evaluator.execute_command(apply, timeout=self.eval_timeout)
@@ -339,7 +392,7 @@ class SWEGymEvaluation(Evaluation):
             "SWE-Gym result %s: resolved=%s exit_code=%s",
             instance.id,
             resolved,
-            eval_result.exit_code,
+            test_result.get("eval_exit_code"),
         )
 
         messages = []
