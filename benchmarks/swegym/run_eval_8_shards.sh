@@ -6,6 +6,7 @@ DATA_NAME="scale-swe"
 ROOT=eval_outputs/${MODEL_NAME}/${DATA_NAME}/$(date +%Y%m%d_%H%M%S)_eval_8shards
 mkdir -p "$ROOT/logs"
 
+SGLANG_DIR=eval_outputs/qwen3-Coder-30B/scale-swe/sglang_replicas8_20260729_110511
 CONFIG_ROOT=${SGLANG_DIR}/configs
 DATASET=/mnt/zj-data/data/dongjie/data/Scale-SWE/scale-swe-samples100-slime.jsonl
 UV=/mnt/zj-data/data/dongjie/.tools/bin/uv
@@ -26,10 +27,10 @@ for shard in {0..7}; do
     --select "$ROOT/../shards/instances-$index" \
     --num-workers 8 \
     --max-iterations 40 \
-    --conversation-timeout 1800 \
+    --conversation-timeout 3600 \
     --setup-timeout 1200 \
     --eval-timeout 900 \
-    --sandbox-lifetime 4500 \
+    --sandbox-lifetime 5400 \
     --max-attempts 1 \
     --max-retries 0 \
     --output-dir "$ROOT/results" \
