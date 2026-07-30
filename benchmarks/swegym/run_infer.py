@@ -189,6 +189,8 @@ def _pre_commands_for(data: dict[str, Any]) -> str:
 def _scale_swe_evaluator_files(
     data: dict[str, Any], git_patch: str
 ) -> list[tuple[str, str]]:
+    if git_patch and not git_patch.endswith("\n"):
+        git_patch += "\n"
     files = [
         ("/tmp/openhands_candidate.patch", git_patch),
         ("/tmp/openhands_f2p.patch", str(data.get("f2p_patch") or "")),

@@ -101,6 +101,7 @@ def test_scale_swe_evaluator_materializes_f2p_script() -> None:
 
     assert files["/workspace/repo/test_fail_to_pass.py"] == data["f2p_script"]
     assert files["/tmp/openhands_f2p.patch"] == "test patch"
+    assert files["/tmp/openhands_candidate.patch"] == "candidate patch\n"
 
 
 def test_pre_commands_sanitization_is_scale_swe_only() -> None:
