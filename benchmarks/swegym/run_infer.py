@@ -191,9 +191,12 @@ def _scale_swe_evaluator_files(
 ) -> list[tuple[str, str]]:
     if git_patch and not git_patch.endswith("\n"):
         git_patch += "\n"
+    f2p_patch = str(data.get("f2p_patch") or "")
+    if f2p_patch and not f2p_patch.endswith("\n"):
+        f2p_patch += "\n"
     files = [
         ("/tmp/openhands_candidate.patch", git_patch),
-        ("/tmp/openhands_f2p.patch", str(data.get("f2p_patch") or "")),
+        ("/tmp/openhands_f2p.patch", f2p_patch),
         (
             "/tmp/openhands_scale_swe_tests.json",
             json.dumps({"test_ids": _scale_swe_test_ids(data)}),
@@ -292,8 +295,10 @@ class SWEGymEvaluation(Evaluation):
             f2p_apply = (
                 "true"
                 if not data.get("f2p_patch")
-                else "git apply --check --whitespace=nowarn /tmp/openhands_f2p.patch "
-                "&& git apply --whitespace=nowarn /tmp/openhands_f2p.patch"
+                else "git apply --recount --check --whitespace=nowarn "
+                "/tmp/openhands_f2p.patch "
+                "&& git apply --recount --whitespace=nowarn "
+                "/tmp/openhands_f2p.patch"
             )
             apply = (
                 f"{write} && {candidate_apply} "
