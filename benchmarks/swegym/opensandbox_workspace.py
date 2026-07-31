@@ -56,7 +56,7 @@ class OpenSandboxWorkspace:
             value = getattr(execution, name, None)
             if value is not None:
                 return int(value)
-        return 0
+        raise RuntimeError("OpenSandbox execution completed without an exit code")
 
     def execute_command(
         self,

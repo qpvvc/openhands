@@ -1,14 +1,22 @@
 import json
+import subprocess
 import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
+from benchmarks.swegym.opensandbox_workspace import OpenSandboxWorkspace
 from benchmarks.swegym.run_infer import (
     ConversationWallClockTimeoutError,
+    _normalize_unified_diff_hunk_counts,
     _pre_commands_for,
-    _scale_swe_evaluator_files,
     _sanitize_pre_commands,
+    _scale_swe_evaluator_files,
+    _scale_swe_grader_completed,
+    _shell_write_text_commands,
+    _validate_f2p_preflight_result,
+    _warn_max_input_tokens,
     conversation_wall_clock_timeout,
     normalize_row,
 )
@@ -104,13 +112,102 @@ def test_scale_swe_evaluator_materializes_f2p_script() -> None:
     assert files["/tmp/openhands_candidate.patch"] == "candidate patch\n"
 
 
+def test_normalize_unified_diff_hunk_counts() -> None:
+    malformed = """diff --git a/test.py b/test.py
+--- a/test.py
++++ b/test.py
+@@ -10,7 +10,9 @@
+ context
+-old
++new one
++new two
+ context
+"""
+
+    normalized = _normalize_unified_diff_hunk_counts(malformed)
+
+    assert "@@ -10,3 +10,4 @@" in normalized
+
+
+def test_shell_write_text_commands_do_not_exceed_argv_limit(tmp_path: Path) -> None:
+    destination = tmp_path / "large patch.txt"
+    content = "large patch payload\n" * 20_000
+
+    commands = _shell_write_text_commands(str(destination), content)
+
+    assert max(map(len, commands)) < 64 * 1024
+    for command in commands:
+        subprocess.run(["bash", "-lc", command], check=True)
+    assert destination.read_text() == content
+
+
+def test_max_input_tokens_overage_is_a_warning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    metrics = SimpleNamespace(
+        token_usages=[
+            SimpleNamespace(prompt_tokens=32_768),
+            SimpleNamespace(prompt_tokens=32_769),
+        ]
+    )
+
+    warnings: list[tuple[str, tuple[int, int]]] = []
+    monkeypatch.setattr(
+        "benchmarks.swegym.run_infer.logger.warning",
+        lambda message, *args: warnings.append((message, args)),
+    )
+
+    _warn_max_input_tokens(metrics, 32_768)
+
+    assert warnings == [
+        (
+            "LLM request exceeded configured max_input_tokens: %d > %d",
+            (32_769, 32_768),
+        )
+    ]
+
+
+def test_invalid_f2p_patch_preflight_is_an_error() -> None:
+    result = SimpleNamespace(
+        exit_code=128,
+        stdout="",
+        stderr="error: corrupt patch at line 15",
+    )
+
+    with pytest.raises(RuntimeError, match="corrupt patch"):
+        _validate_f2p_preflight_result(result)
+
+
+def test_scale_swe_grader_requires_completion_evidence() -> None:
+    result = SimpleNamespace(exit_code=0, stdout="", stderr="")
+
+    with pytest.raises(RuntimeError, match="without pytest completion evidence"):
+        _scale_swe_grader_completed(result)
+
+
+def test_scale_swe_grader_accepts_matching_completion_evidence() -> None:
+    result = SimpleNamespace(
+        exit_code=0,
+        stdout="1 passed\nOPENHANDS_SCALE_SWE_PYTEST_EXIT_CODE=0\n",
+        stderr="",
+    )
+
+    assert _scale_swe_grader_completed(result)
+
+
+def test_opensandbox_missing_exit_code_is_an_error() -> None:
+    with pytest.raises(RuntimeError, match="without an exit code"):
+        OpenSandboxWorkspace._exit_code(SimpleNamespace())
+
+
 def test_pre_commands_sanitization_is_scale_swe_only() -> None:
     commands = "git gc --prune=now --aggressive\\n"
 
     assert _pre_commands_for({"pre_commands": commands}) == commands
-    assert _pre_commands_for(
-        {"dataset_kind": "scale_swe", "pre_commands": commands}
-    ) == "git gc --prune=now\n"
+    assert (
+        _pre_commands_for({"dataset_kind": "scale_swe", "pre_commands": commands})
+        == "git gc --prune=now\n"
+    )
 
 
 def test_sanitize_pre_commands_keeps_trailing_newline_after_git_gc() -> None:

@@ -10,9 +10,9 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator, List
 
+import pandas as pd
 from jinja2 import Environment, FileSystemLoader
 from omegaconf import OmegaConf
-import pandas as pd
 from pydantic import Field
 
 from benchmarks.swegym.opensandbox_workspace import (
@@ -43,7 +43,7 @@ DEFAULT_DATASET = (
     Path(__file__).resolve().parents[4]
     / "data/SWE-Gym/processed/swe_gym_8unique_easy_osb.jsonl"
 )
-_SCALE_SWE_RUNNER = r'''import json
+_SCALE_SWE_RUNNER = r"""import json
 import sys
 
 import pytest
@@ -51,14 +51,103 @@ import pytest
 with open(sys.argv[1], encoding="utf-8") as stream:
     test_ids = json.load(stream)["test_ids"]
 sys.path.insert(0, ".")
-raise SystemExit(pytest.main(["-q", "--tb=short", "--no-header", "-o", "addopts=", "--rootdir=.", *test_ids]))
-'''
+exit_code = int(pytest.main(["-q", "--tb=short", "--no-header", "-o", "addopts=", "--rootdir=.", *test_ids]))
+print(f"OPENHANDS_SCALE_SWE_PYTEST_EXIT_CODE={exit_code}", flush=True)
+raise SystemExit(exit_code)
+"""
+_SCALE_SWE_PYTEST_SENTINEL = "OPENHANDS_SCALE_SWE_PYTEST_EXIT_CODE="
+_SHELL_WRITE_CHUNK_BYTES = 24 * 1024
+_DIFF_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*?)(\r?\n)?$")
 
 
-def _shell_write_text(path: str, content: str) -> str:
-    """Return a shell command that writes arbitrary UTF-8 content safely."""
-    encoded = base64.b64encode(content.encode()).decode()
-    return f"echo {shlex.quote(encoded)} | base64 -d > {shlex.quote(path)}"
+def _shell_write_text_commands(path: str, content: str) -> list[str]:
+    """Build bounded shell commands that materialize UTF-8 text."""
+    quoted_path = shlex.quote(path)
+    commands = [f": > {quoted_path}"]
+    payload = content.encode()
+    for offset in range(0, len(payload), _SHELL_WRITE_CHUNK_BYTES):
+        encoded = base64.b64encode(
+            payload[offset : offset + _SHELL_WRITE_CHUNK_BYTES]
+        ).decode()
+        commands.append(
+            f"printf %s {shlex.quote(encoded)} | base64 -d >> {quoted_path}"
+        )
+    return commands
+
+
+def _materialize_workspace_files(
+    workspace: OpenSandboxWorkspace, files: list[tuple[str, str]]
+) -> None:
+    for path, content in files:
+        for command in _shell_write_text_commands(path, content):
+            result = workspace.execute_command(command)
+            if result.exit_code != 0:
+                raise RuntimeError(
+                    f"Failed to materialize evaluator file {path}: "
+                    f"{result.stderr or result.stdout}"
+                )
+
+
+def _normalize_unified_diff_hunk_counts(patch: str) -> str:
+    lines = patch.splitlines(keepends=True)
+    normalized: list[str] = []
+    index = 0
+    while index < len(lines):
+        match = _DIFF_HUNK_HEADER.match(lines[index])
+        if match is None:
+            normalized.append(lines[index])
+            index += 1
+            continue
+
+        body_end = index + 1
+        while body_end < len(lines) and not (
+            lines[body_end].startswith("@@ ")
+            or lines[body_end].startswith("diff --git ")
+        ):
+            body_end += 1
+        body = lines[index + 1 : body_end]
+        old_count = sum(line.startswith((" ", "-")) for line in body)
+        new_count = sum(line.startswith((" ", "+")) for line in body)
+        newline = match.group(4) or ""
+        normalized.append(
+            f"@@ -{match.group(1)},{old_count} +{match.group(2)},{new_count} "
+            f"@@{match.group(3)}{newline}"
+        )
+        normalized.extend(body)
+        index = body_end
+    return "".join(normalized)
+
+
+def _warn_max_input_tokens(metrics: Any, max_input_tokens: int | None) -> None:
+    if max_input_tokens is None:
+        return
+    for usage in metrics.token_usages:
+        if usage.prompt_tokens > max_input_tokens:
+            logger.warning(
+                "LLM request exceeded configured max_input_tokens: %d > %d",
+                usage.prompt_tokens,
+                max_input_tokens,
+            )
+
+
+def _validate_f2p_preflight_result(result: Any) -> None:
+    if result.exit_code != 0:
+        raise RuntimeError(
+            f"Scale-SWE F2P patch failed preflight: {result.stderr or result.stdout}"
+        )
+
+
+def _scale_swe_grader_completed(result: Any) -> bool:
+    sentinel_match = re.search(rf"{_SCALE_SWE_PYTEST_SENTINEL}(\d+)", result.stdout)
+    if result.exit_code == 0 and sentinel_match is None:
+        raise RuntimeError(
+            "Scale-SWE grader returned exit code 0 without pytest completion evidence"
+        )
+    if sentinel_match is not None and int(sentinel_match.group(1)) != result.exit_code:
+        raise RuntimeError(
+            "Scale-SWE grader exit code disagrees with pytest completion evidence"
+        )
+    return sentinel_match is not None
 
 
 def _scale_swe_test_ids(data: dict[str, Any]) -> list[str]:
@@ -174,9 +263,7 @@ def _sanitize_pre_commands(pre_commands: str | None) -> str:
     sanitized = pre_commands
     sanitized = sanitized.replace("\\n", "\n")
     sanitized = sanitized.replace("\\r", "\r")
-    return re.sub(
-        r"(git\s+gc\b[^;\n&|]*?)\s+--aggressive\b", r"\1", sanitized
-    )
+    return re.sub(r"(git\s+gc\b[^;\n&|]*?)\s+--aggressive\b", r"\1", sanitized)
 
 
 def _pre_commands_for(data: dict[str, Any]) -> str:
@@ -196,7 +283,10 @@ def _scale_swe_evaluator_files(
         f2p_patch += "\n"
     files = [
         ("/tmp/openhands_candidate.patch", git_patch),
-        ("/tmp/openhands_f2p.patch", f2p_patch),
+        (
+            "/tmp/openhands_f2p.patch",
+            _normalize_unified_diff_hunk_counts(str(data.get("f2p_patch") or "")),
+        ),
         (
             "/tmp/openhands_scale_swe_tests.json",
             json.dumps({"test_ids": _scale_swe_test_ids(data)}),
@@ -262,31 +352,52 @@ class SWEGymEvaluation(Evaluation):
             self._prepare_scale_swe_workspace(workspace, instance)
         return workspace  # type: ignore[return-value]
 
-    def _prepare_scale_swe_workspace(self, workspace: OpenSandboxWorkspace, instance: EvalInstance) -> None:
+    def _prepare_scale_swe_workspace(
+        self, workspace: OpenSandboxWorkspace, instance: EvalInstance
+    ) -> None:
         problem = str(instance.data["problem_statement"])
+        _materialize_workspace_files(
+            workspace,
+            [(f"{instance.data['workdir']}/PROBLEM_STATEMENT.md", problem)],
+        )
         command = " && ".join(
             [
-                _shell_write_text(f"{instance.data['workdir']}/PROBLEM_STATEMENT.md", problem),
                 "git config user.email 'openhands-eval@example.test'",
                 "git config user.name 'OpenHands Eval'",
             ]
         )
         setup = workspace.execute_command(command, timeout=self.setup_timeout)
         if setup.exit_code != 0:
-            raise RuntimeError(f"Scale-SWE setup failed: {setup.stderr or setup.stdout}")
+            raise RuntimeError(
+                f"Scale-SWE setup failed: {setup.stderr or setup.stdout}"
+            )
 
-    def _evaluate_scale_swe_patch(self, instance: EvalInstance, git_patch: str) -> dict[str, Any]:
+    def _evaluate_scale_swe_patch(
+        self, instance: EvalInstance, git_patch: str
+    ) -> dict[str, Any]:
         """Grade on a clean sandbox, matching Slime's Scale-SWE F2P/P2P contract."""
         data = instance.data
         workdir = str(data["workdir"])
-        with OpenSandboxWorkspace(str(data["image"]), workdir, self.sandbox_lifetime) as evaluator:
+        with OpenSandboxWorkspace(
+            str(data["image"]), workdir, self.sandbox_lifetime
+        ) as evaluator:
             pre = evaluator.execute_command(
                 _pre_commands_for(data), timeout=self.setup_timeout
             )
             if pre.exit_code != 0:
-                return {"resolved": False, "reason": "evaluator_setup_failed", "stderr": pre.stderr[-4000:]}
+                return {
+                    "resolved": False,
+                    "reason": "evaluator_setup_failed",
+                    "stderr": pre.stderr[-4000:],
+                }
             files = _scale_swe_evaluator_files(data, git_patch)
-            write = " && ".join(_shell_write_text(path, content) for path, content in files)
+            _materialize_workspace_files(evaluator, files)
+            if data.get("f2p_patch"):
+                preflight = evaluator.execute_command(
+                    "git apply --check --whitespace=nowarn /tmp/openhands_f2p.patch",
+                    timeout=self.setup_timeout,
+                )
+                _validate_f2p_preflight_result(preflight)
             candidate_apply = (
                 "true"
                 if not git_patch.strip()
@@ -301,14 +412,15 @@ class SWEGymEvaluation(Evaluation):
                 "/tmp/openhands_f2p.patch"
             )
             apply = (
-                f"{write} && {candidate_apply} "
-                f"&& {f2p_apply} "
+                f"{candidate_apply} && {f2p_apply} "
                 "&& python /tmp/openhands_scale_swe_pytest.py /tmp/openhands_scale_swe_tests.json"
             )
             result = evaluator.execute_command(apply, timeout=self.eval_timeout)
+            grader_completed = _scale_swe_grader_completed(result)
             return {
                 "resolved": result.exit_code == 0,
                 "grader": "scale_swe",
+                "grader_completed": grader_completed,
                 "eval_exit_code": result.exit_code,
                 "eval_stdout": result.stdout[-4000:],
                 "eval_stderr": result.stderr[-4000:],
@@ -357,9 +469,7 @@ class SWEGymEvaluation(Evaluation):
         )
         conversation.send_message(instruction)
         try:
-            with conversation_wall_clock_timeout(
-                self.metadata.conversation_timeout
-            ):
+            with conversation_wall_clock_timeout(self.metadata.conversation_timeout):
                 run_conversation_with_fake_user_response(conversation)
         except ConversationWallClockTimeoutError:
             logger.warning(
@@ -367,6 +477,9 @@ class SWEGymEvaluation(Evaluation):
                 self.metadata.conversation_timeout,
                 instance.id,
             )
+
+        metrics = conversation.conversation_stats.get_combined_metrics()
+        _warn_max_input_tokens(metrics, self.metadata.llm.max_input_tokens)
 
         base_commit = str(instance.data.get("base_commit") or "HEAD")
         patch_result = workspace.execute_command(
@@ -383,7 +496,9 @@ class SWEGymEvaluation(Evaluation):
             test_result = self._evaluate_scale_swe_patch(instance, git_patch)
             resolved = bool(test_result["resolved"])
         else:
-            eval_timeout = int(instance.data.get("eval_timeout_sec") or self.eval_timeout)
+            eval_timeout = int(
+                instance.data.get("eval_timeout_sec") or self.eval_timeout
+            )
             eval_result = workspace.execute_command(
                 str(instance.data["eval_cmd"]), timeout=eval_timeout
             )
@@ -444,7 +559,7 @@ class SWEGymEvaluation(Evaluation):
             instruction=instruction,
             error=None,
             history=list(conversation.state.events),
-            metrics=conversation.conversation_stats.get_combined_metrics(),
+            metrics=metrics,
         )
 
 
