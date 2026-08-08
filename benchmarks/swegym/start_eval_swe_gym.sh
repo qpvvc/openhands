@@ -29,6 +29,7 @@ NUM_WORKERS="${NUM_WORKERS:-8}"
 PARALLEL_ROUNDS="${PARALLEL_ROUNDS:-1}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-100}"
 CONVERSATION_TIMEOUT="${CONVERSATION_TIMEOUT:-3600}"
+MAX_RETRIES="${MAX_RETRIES:-2}"
 RUN_NOTE="${RUN_NOTE:-slime_aligned_$(date +%Y%m%d_%H%M%S)}"
 
 cd "$BENCHMARKS_ROOT"
@@ -56,7 +57,7 @@ run_rollout() {
     --eval-timeout 900 \
     --sandbox-lifetime 4500 \
     --max-attempts 1 \
-    --max-retries 0 \
+    --max-retries "$MAX_RETRIES" \
     --output-dir "$OUTPUT_DIR" \
     --note "${RUN_NOTE}_r${rollout}"
 }

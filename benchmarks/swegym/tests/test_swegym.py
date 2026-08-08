@@ -40,6 +40,29 @@ def test_normalize_prepared_row() -> None:
     assert data["problem_statement"] == "fix it"
 
 
+def test_normalize_prepared_row_applies_sandbox_image_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SANDBOX_IMAGE_PREFIX", "registry.test")
+    row = {
+        "prompt": "fix it",
+        "label": "org__repo-1",
+        "metadata": {
+            "image": "xingyaoww/sweb.eval.x86_64.org_s_repo-1:latest",
+            "workdir": "/testbed",
+            "base_commit": "abc",
+            "pre_commands": "true",
+            "eval_cmd": "./eval.sh",
+        },
+    }
+
+    data = normalize_row(row)
+
+    assert data["image"] == (
+        "registry.test/xingyaoww/sweb.eval.x86_64.org_s_repo-1:latest"
+    )
+
+
 def test_normalize_rejects_raw_row() -> None:
     with pytest.raises(ValueError, match="prepared .*_osb.jsonl"):
         normalize_row({"instance_id": "org__repo-1", "problem_statement": "x"})

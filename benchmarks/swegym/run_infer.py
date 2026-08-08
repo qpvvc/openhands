@@ -219,6 +219,12 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
         data["dataset_kind"] = "scale_swe"
         return data
 
+    image = str(data.get("image") or "")
+    image_prefix = os.getenv("SANDBOX_IMAGE_PREFIX", "").rstrip("/")
+    if image and image_prefix and not image.startswith(f"{image_prefix}/"):
+        image = f"{image_prefix}/{image.lstrip('/')}"
+    data["image"] = image
+
     required = {
         "instance_id",
         "image",
