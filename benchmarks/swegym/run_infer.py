@@ -6,10 +6,11 @@ import os
 import re
 import shlex
 import signal
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterator, List
 
+import numpy as np
 import pandas as pd
 from jinja2 import Environment, FileSystemLoader
 from omegaconf import OmegaConf
@@ -56,8 +57,13 @@ print(f"OPENHANDS_SCALE_SWE_PYTEST_EXIT_CODE={exit_code}", flush=True)
 raise SystemExit(exit_code)
 """
 _SCALE_SWE_PYTEST_SENTINEL = "OPENHANDS_SCALE_SWE_PYTEST_EXIT_CODE="
+_SWE_GYM_TEST_PATCH_MARKER = ".swe_eval/test_patch_applied"
+_SWE_GYM_ISOLATED_TEST_KILLED = "OPENHANDS_SWE_GYM_ISOLATED_TEST_KILLED="
+_SWE_GYM_EVAL_HEREDOC = "OPENHANDS_SWE_GYM_EVAL_SCRIPT"
 _SHELL_WRITE_CHUNK_BYTES = 24 * 1024
 _DIFF_HUNK_HEADER = re.compile(r"^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@(.*?)(\r?\n)?$")
+_GIT_TREE_HASH = re.compile(r"[0-9a-f]{40,64}")
+_MISSING_FILE = re.compile(r"No such file or directory: ['\"]([^'\"]+)['\"]")
 
 
 def _shell_write_text_commands(path: str, content: str) -> list[str]:
@@ -79,13 +85,22 @@ def _materialize_workspace_files(
     workspace: OpenSandboxWorkspace, files: list[tuple[str, str]]
 ) -> None:
     for path, content in files:
-        for command in _shell_write_text_commands(path, content):
-            result = workspace.execute_command(command)
-            if result.exit_code != 0:
-                raise RuntimeError(
-                    f"Failed to materialize evaluator file {path}: "
-                    f"{result.stderr or result.stdout}"
-                )
+        try:
+            workspace.write_file(path, content)
+        except Exception as exc:
+            raise RuntimeError(
+                f"Failed to materialize evaluator file {path}: {exc}"
+            ) from exc
+
+
+def _extract_plaintext_eval_script(commands: str) -> str | None:
+    prefix = (
+        f"mkdir -p .swe_eval\ncat > .swe_eval/eval.sh <<'{_SWE_GYM_EVAL_HEREDOC}'\n"
+    )
+    suffix = f"\n{_SWE_GYM_EVAL_HEREDOC}\nchmod 755 .swe_eval/eval.sh\n"
+    if not commands.startswith(prefix) or not commands.endswith(suffix):
+        return None
+    return commands[len(prefix) : -len(suffix)] + "\n"
 
 
 def _normalize_unified_diff_hunk_counts(patch: str) -> str:
@@ -116,6 +131,61 @@ def _normalize_unified_diff_hunk_counts(patch: str) -> str:
         normalized.extend(body)
         index = body_end
     return "".join(normalized)
+
+
+def _terminate_patch(patch: str) -> str:
+    return patch + "\n" if patch and not patch.endswith("\n") else patch
+
+
+def _candidate_apply_command(path: str) -> str:
+    quoted_path = shlex.quote(path)
+    return (
+        f"git apply --whitespace=nowarn {quoted_path} || "
+        f"git apply --3way --whitespace=nowarn {quoted_path}"
+    )
+
+
+def _candidate_deleted_missing_path(
+    patch: str, stderr: str, workdir: str
+) -> str | None:
+    deleted_paths: set[str] = set()
+    current_path: str | None = None
+    for line in patch.splitlines():
+        if line.startswith("diff --git a/") and " b/" in line:
+            current_path = line.split(" b/", 1)[1]
+        elif line.startswith("deleted file mode ") and current_path:
+            deleted_paths.add(current_path)
+
+    for match in _MISSING_FILE.finditer(stderr):
+        missing = match.group(1)
+        if missing.startswith(f"{workdir.rstrip('/')}/"):
+            missing = missing[len(workdir.rstrip("/")) + 1 :]
+        if missing.startswith("./"):
+            missing = missing[2:]
+        if missing in deleted_paths:
+            return missing
+    return None
+
+
+def _workspace_baseline_tree_command() -> str:
+    """Write the sandbox's initial worktree to a temporary Git index."""
+    return (
+        'baseline_index="$(mktemp)" && '
+        "trap 'rm -f \"$baseline_index\"' EXIT && "
+        'GIT_INDEX_FILE="$baseline_index" git read-tree HEAD && '
+        'GIT_INDEX_FILE="$baseline_index" git add -A -- . '
+        "':(exclude).swe_eval/**' ':(exclude)PROBLEM_STATEMENT.md' && "
+        'GIT_INDEX_FILE="$baseline_index" git write-tree'
+    )
+
+
+def _candidate_diff_command(baseline_tree: str) -> str:
+    return (
+        "git config core.fileMode false && "
+        "git add -A -- . ':(exclude).swe_eval/**' ':(exclude)PROBLEM_STATEMENT.md' && "
+        f"git --no-pager diff --cached --binary --no-color {shlex.quote(baseline_tree)} -- . "
+        "':(exclude).swe_eval/**' ':(exclude)PROBLEM_STATEMENT.md'"
+    )
 
 
 def _warn_max_input_tokens(metrics: Any, max_input_tokens: int | None) -> None:
@@ -193,15 +263,17 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     """Flatten the prompt/label/metadata format used by prepared SWE-Gym data."""
     metadata = row.get("metadata")
     if isinstance(metadata, dict):
-        data = dict(metadata)
+        data = _to_builtin_types(dict(metadata))
         data.setdefault("instance_id", row.get("label"))
         data.setdefault("problem_statement", row.get("prompt"))
     else:
-        data = dict(row)
+        data = _to_builtin_types(dict(row))
 
     if data.get("_slime_dataset") == "scale_swe":
         image = str(data.get("image") or data.get("image_url") or "")
-        prefix = os.getenv("SCALE_SWE_IMAGE_PREFIX", "").rstrip("/")
+        prefix = (
+            os.getenv("SCALE_SWE_IMAGE_PREFIX") or os.getenv("SANDBOX_IMAGE_PREFIX", "")
+        ).rstrip("/")
         if prefix and image and not image.startswith(f"{prefix}/"):
             image = f"{prefix}/{image.lstrip('/')}"
         data["image"] = image
@@ -231,8 +303,9 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
         "workdir",
         "problem_statement",
         "base_commit",
-        "pre_commands",
+        "evaluator_pre_commands",
         "eval_cmd",
+        "test_patch",
     }
     missing = sorted(key for key in required if not data.get(key))
     if missing:
@@ -240,7 +313,21 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
             "SWE-Gym row is missing executable metadata "
             f"{missing}. Use a prepared *_osb.jsonl dataset, not the raw Parquet."
         )
+    data["dataset_kind"] = "swe_gym"
     return data
+
+
+def _to_builtin_types(value: Any) -> Any:
+    """Convert pandas/NumPy container values into JSON-safe Python values."""
+    if isinstance(value, dict):
+        return {key: _to_builtin_types(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_to_builtin_types(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return [_to_builtin_types(item) for item in value.tolist()]
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
 
 
 def get_instruction(
@@ -279,19 +366,30 @@ def _pre_commands_for(data: dict[str, Any]) -> str:
     return commands
 
 
+def _evaluator_pre_commands_for(data: dict[str, Any]) -> str:
+    """Apply evaluator resource guards to prepared and legacy datasets."""
+    commands = str(data.get("evaluator_pre_commands") or "true")
+    if data.get("repo") == "pandas-dev/pandas":
+        editable_setting = "-Ceditable-verbose=true"
+        compile_limit = "-Ccompile-args=-j2"
+        if editable_setting in commands and compile_limit not in commands:
+            commands = commands.replace(
+                editable_setting,
+                f"{editable_setting} {compile_limit}",
+            )
+    return commands
+
+
 def _scale_swe_evaluator_files(
     data: dict[str, Any], git_patch: str
 ) -> list[tuple[str, str]]:
-    if git_patch and not git_patch.endswith("\n"):
-        git_patch += "\n"
-    f2p_patch = str(data.get("f2p_patch") or "")
-    if f2p_patch and not f2p_patch.endswith("\n"):
-        f2p_patch += "\n"
+    git_patch = _terminate_patch(git_patch)
+    f2p_patch = _terminate_patch(str(data.get("f2p_patch") or ""))
     files = [
         ("/tmp/openhands_candidate.patch", git_patch),
         (
             "/tmp/openhands_f2p.patch",
-            _normalize_unified_diff_hunk_counts(str(data.get("f2p_patch") or "")),
+            _normalize_unified_diff_hunk_counts(f2p_patch),
         ),
         (
             "/tmp/openhands_scale_swe_tests.json",
@@ -328,7 +426,7 @@ class SWEGymEvaluation(Evaluation):
         )
         instances: list[EvalInstance] = []
         for _, row in df.iterrows():
-            data = row.to_dict()
+            data = _to_builtin_types(row.to_dict())
             instances.append(EvalInstance(id=str(data["instance_id"]), data=data))
         logger.info("Total SWE-Gym instances to process: %d", len(instances))
         return instances
@@ -339,24 +437,206 @@ class SWEGymEvaluation(Evaluation):
         resource_factor: int = 1,
         forward_env: list[str] | None = None,
     ) -> RemoteWorkspace:
-        del resource_factor, forward_env
+        del forward_env
         workspace = OpenSandboxWorkspace(
             image=str(instance.data["image"]),
             working_dir=str(instance.data["workdir"]),
             lifetime=self.sandbox_lifetime,
+            resource_factor=resource_factor,
         )
-        setup = workspace.execute_command(
-            _pre_commands_for(instance.data), timeout=self.setup_timeout
+        filemode = workspace.execute_command(
+            "git config core.fileMode false", timeout=30
         )
-        if setup.exit_code != 0:
+        if filemode.exit_code != 0:
             workspace.__exit__(None, None, None)
             raise RuntimeError(
-                f"pre_commands failed with exit code {setup.exit_code}: "
-                f"{setup.stderr or setup.stdout}"
+                "failed to disable Git file-mode tracking: "
+                f"{filemode.stderr or filemode.stdout}"
             )
-        if instance.data.get("dataset_kind") == "scale_swe":
-            self._prepare_scale_swe_workspace(workspace, instance)
+        if instance.data.get("dataset_kind") != "swe_gym":
+            setup = workspace.execute_command(
+                _pre_commands_for(instance.data), timeout=self.setup_timeout
+            )
+            if setup.exit_code != 0:
+                workspace.__exit__(None, None, None)
+                raise RuntimeError(
+                    f"pre_commands failed with exit code {setup.exit_code}: "
+                    f"{setup.stderr or setup.stdout}"
+                )
+            if instance.data.get("dataset_kind") == "scale_swe":
+                self._prepare_scale_swe_workspace(workspace, instance)
+
+        baseline = workspace.execute_command(
+            _workspace_baseline_tree_command(), timeout=120
+        )
+        baseline_tree = (
+            baseline.stdout.strip().splitlines()[-1] if baseline.stdout else ""
+        )
+        if baseline.exit_code != 0 or _GIT_TREE_HASH.fullmatch(baseline_tree) is None:
+            workspace.__exit__(None, None, None)
+            raise RuntimeError(
+                "failed to capture initial Git worktree: "
+                f"{baseline.stderr or baseline.stdout}"
+            )
+        instance.data["_workspace_baseline_tree"] = baseline_tree
         return workspace  # type: ignore[return-value]
+
+    def _evaluate_swe_gym_patch(
+        self,
+        instance: EvalInstance,
+        git_patch: str,
+        agent_workspace: OpenSandboxWorkspace | None = None,
+        resource_factor: int = 1,
+    ) -> dict[str, Any]:
+        """Grade after the agent is done, before hidden files become visible."""
+        data = instance.data
+        workdir = str(data["workdir"])
+        evaluator_context = (
+            nullcontext(agent_workspace)
+            if agent_workspace is not None
+            else OpenSandboxWorkspace(
+                str(data["image"]),
+                workdir,
+                self.sandbox_lifetime,
+                resource_factor=resource_factor,
+            )
+        )
+        with evaluator_context as evaluator:
+            assert evaluator is not None
+            reset = evaluator.execute_command(
+                "git reset --hard "
+                f"{shlex.quote(str(data['base_commit']))} && git clean -fd",
+                timeout=min(self.setup_timeout, 60),
+            )
+            if reset.exit_code != 0:
+                return {
+                    "resolved": False,
+                    "reason": "evaluator_setup_failed",
+                    "setup_exit_code": reset.exit_code,
+                    "setup_stdout": reset.stdout[-4000:],
+                    "setup_stderr": reset.stderr[-4000:],
+                    "setup_timed_out": reset.timeout_occurred,
+                }
+            evaluator_commands = _evaluator_pre_commands_for(data)
+            eval_script = _extract_plaintext_eval_script(evaluator_commands)
+            if eval_script is None:
+                setup = evaluator.execute_command(
+                    evaluator_commands,
+                    timeout=min(self.setup_timeout, 120),
+                )
+            else:
+                setup = evaluator.execute_command(
+                    "mkdir -p .swe_eval",
+                    timeout=min(self.setup_timeout, 60),
+                )
+                if setup.exit_code == 0:
+                    try:
+                        _materialize_workspace_files(
+                            evaluator,
+                            [(f"{workdir}/.swe_eval/eval.sh", eval_script)],
+                        )
+                    except RuntimeError as exc:
+                        return {
+                            "resolved": False,
+                            "reason": "evaluator_setup_failed",
+                            "setup_exit_code": -1,
+                            "setup_stdout": "",
+                            "setup_stderr": str(exc)[-4000:],
+                            "setup_timed_out": False,
+                        }
+                    setup = evaluator.execute_command(
+                        f"chmod 755 {shlex.quote(workdir + '/.swe_eval/eval.sh')}",
+                        timeout=min(self.setup_timeout, 60),
+                    )
+            if setup.exit_code != 0:
+                return {
+                    "resolved": False,
+                    "reason": "evaluator_setup_failed",
+                    "setup_exit_code": setup.exit_code,
+                    "setup_stdout": setup.stdout[-4000:],
+                    "setup_stderr": setup.stderr[-4000:],
+                    "setup_timed_out": setup.timeout_occurred,
+                }
+
+            _materialize_workspace_files(
+                evaluator,
+                [
+                    ("/tmp/openhands_candidate.patch", _terminate_patch(git_patch)),
+                    (f"{workdir}/.swe_eval/test.patch", str(data["test_patch"])),
+                ],
+            )
+            chmod = evaluator.execute_command(
+                f"chmod 755 {shlex.quote(workdir + '/.swe_eval/eval.sh')}",
+                timeout=30,
+            )
+            if chmod.exit_code != 0:
+                return {
+                    "resolved": False,
+                    "reason": "evaluator_setup_failed",
+                    "setup_exit_code": chmod.exit_code,
+                    "setup_stdout": chmod.stdout[-4000:],
+                    "setup_stderr": chmod.stderr[-4000:],
+                    "setup_timed_out": chmod.timeout_occurred,
+                }
+            candidate_apply = evaluator.execute_command(
+                "true"
+                if not git_patch.strip()
+                else _candidate_apply_command("/tmp/openhands_candidate.patch"),
+                timeout=min(self.setup_timeout, 120),
+            )
+            if candidate_apply.exit_code != 0:
+                return {
+                    "resolved": False,
+                    "reason": "candidate_patch_apply_failed",
+                    "candidate_patch_applied": False,
+                    "candidate_apply_exit_code": candidate_apply.exit_code,
+                    "candidate_apply_stdout": candidate_apply.stdout[-4000:],
+                    "candidate_apply_stderr": candidate_apply.stderr[-4000:],
+                    "candidate_apply_timed_out": candidate_apply.timeout_occurred,
+                }
+
+            eval_timeout = int(data.get("eval_timeout_sec") or self.eval_timeout)
+            result = evaluator.execute_command(
+                str(data["eval_cmd"]), timeout=eval_timeout
+            )
+            marker = evaluator.execute_command(
+                f"test -f {shlex.quote(f'{workdir}/{_SWE_GYM_TEST_PATCH_MARKER}')}",
+                timeout=30,
+            )
+            test_patch_applied = marker.exit_code == 0
+            resolved = result.exit_code == 0 and test_patch_applied
+            reason = None
+            candidate_broke_evaluator_input = None
+            if result.timeout_occurred:
+                reason = "eval_timeout"
+            elif (
+                result.exit_code == 75
+                and _SWE_GYM_ISOLATED_TEST_KILLED in result.stderr
+            ):
+                reason = "eval_worker_killed"
+            elif not test_patch_applied:
+                candidate_broke_evaluator_input = _candidate_deleted_missing_path(
+                    git_patch, result.stderr, workdir
+                )
+                reason = (
+                    "tests_failed"
+                    if candidate_broke_evaluator_input
+                    else "test_patch_not_applied"
+                )
+            elif result.exit_code != 0:
+                reason = "tests_failed"
+            return {
+                "resolved": resolved,
+                "reason": reason,
+                "grader": "swe_gym",
+                "candidate_patch_applied": True,
+                "test_patch_applied": test_patch_applied,
+                "eval_exit_code": result.exit_code,
+                "eval_stdout": result.stdout,
+                "eval_stderr": result.stderr,
+                "timed_out": result.timeout_occurred,
+                "candidate_broke_evaluator_input": candidate_broke_evaluator_input,
+            }
 
     def _prepare_scale_swe_workspace(
         self, workspace: OpenSandboxWorkspace, instance: EvalInstance
@@ -396,6 +676,15 @@ class SWEGymEvaluation(Evaluation):
                     "reason": "evaluator_setup_failed",
                     "stderr": pre.stderr[-4000:],
                 }
+            evaluator_pre = evaluator.execute_command(
+                _evaluator_pre_commands_for(data), timeout=self.setup_timeout
+            )
+            if evaluator_pre.exit_code != 0:
+                return {
+                    "resolved": False,
+                    "reason": "evaluator_setup_failed",
+                    "stderr": evaluator_pre.stderr[-4000:],
+                }
             files = _scale_swe_evaluator_files(data, git_patch)
             _materialize_workspace_files(evaluator, files)
             if data.get("f2p_patch"):
@@ -407,7 +696,7 @@ class SWEGymEvaluation(Evaluation):
             candidate_apply = (
                 "true"
                 if not git_patch.strip()
-                else "git apply --3way --whitespace=nowarn /tmp/openhands_candidate.patch"
+                else _candidate_apply_command("/tmp/openhands_candidate.patch")
             )
             f2p_apply = (
                 "true"
@@ -487,35 +776,29 @@ class SWEGymEvaluation(Evaluation):
         metrics = conversation.conversation_stats.get_combined_metrics()
         _warn_max_input_tokens(metrics, self.metadata.llm.max_input_tokens)
 
-        base_commit = str(instance.data.get("base_commit") or "HEAD")
+        baseline_tree = str(
+            instance.data.get("_workspace_baseline_tree")
+            or instance.data.get("base_commit")
+            or "HEAD"
+        )
         patch_result = workspace.execute_command(
-            "git add -A -- . ':(exclude).swe_eval/**' ':(exclude)PROBLEM_STATEMENT.md' && "
-            f"git --no-pager diff --cached --no-color {base_commit} -- . "
-            "':(exclude).swe_eval/**' ':(exclude)PROBLEM_STATEMENT.md'",
+            _candidate_diff_command(baseline_tree),
             timeout=120,
         )
         if patch_result.exit_code != 0:
             raise RuntimeError(f"git diff failed: {patch_result.stderr}")
         git_patch = patch_result.stdout
+        candidate_patch_file = (
+            Path(self.metadata.eval_output_dir) / f"{instance.id}.candidate.patch"
+        )
+        candidate_patch_file.write_text(git_patch)
 
         if instance.data.get("dataset_kind") == "scale_swe":
             test_result = self._evaluate_scale_swe_patch(instance, git_patch)
             resolved = bool(test_result["resolved"])
         else:
-            eval_timeout = int(
-                instance.data.get("eval_timeout_sec") or self.eval_timeout
-            )
-            eval_result = workspace.execute_command(
-                str(instance.data["eval_cmd"]), timeout=eval_timeout
-            )
-            resolved = eval_result.exit_code == 0
-            test_result = {
-                "git_patch": git_patch,
-                "resolved": resolved,
-                "eval_exit_code": eval_result.exit_code,
-                "eval_stdout": eval_result.stdout,
-                "eval_stderr": eval_result.stderr,
-            }
+            test_result = self._evaluate_swe_gym_patch(instance, git_patch, workspace)
+            resolved = bool(test_result["resolved"])
         logger.info(
             "SWE-Gym result %s: resolved=%s exit_code=%s",
             instance.id,
