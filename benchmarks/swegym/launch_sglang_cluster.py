@@ -19,7 +19,9 @@ def wait_until_ready(url: str, process: subprocess.Popen[str], timeout: int) -> 
     opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     while time.monotonic() < deadline:
         if process.poll() is not None:
-            raise RuntimeError(f"Process exited with status {process.returncode}: {url}")
+            raise RuntimeError(
+                f"Process exited with status {process.returncode}: {url}"
+            )
         try:
             with opener.open(url, timeout=5) as response:
                 if response.status == 200:
