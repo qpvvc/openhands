@@ -1,11 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import os
 import shlex
+import time
+from contextlib import contextmanager
 from datetime import timedelta
 from pathlib import Path
-from typing import Any, Sequence, cast
+from typing import Any, Iterator, Sequence, TextIO, cast
 from uuid import uuid4
 
 from openhands.sdk.tool import ToolAnnotations, ToolDefinition, ToolExecutor
@@ -20,6 +23,36 @@ _THREAD_LIMIT_ENV = (
     "NUMEXPR_NUM_THREADS=1 VECLIB_MAXIMUM_THREADS=1 "
     "NINJAFLAGS=-j2 MAKEFLAGS=-j2 CMAKE_BUILD_PARALLEL_LEVEL=2 MAX_JOBS=2"
 )
+
+
+@contextmanager
+def _sandbox_boot_slot() -> Iterator[None]:
+    """Limit concurrent sandbox creation across evaluator shard processes."""
+    concurrency = int(os.getenv("SWE_BOOT_CONCURRENCY", "8"))
+    if concurrency < 1:
+        raise ValueError("SWE_BOOT_CONCURRENCY must be at least 1")
+    lock_dir = Path(os.getenv("SWE_BOOT_LOCK_DIR", "/tmp/openhands-swegym-boot"))
+    lock_dir.mkdir(parents=True, exist_ok=True)
+
+    lock_file: TextIO | None = None
+    while lock_file is None:
+        for slot in range(concurrency):
+            candidate = (lock_dir / f"slot-{slot}").open("a+")
+            try:
+                fcntl.flock(candidate, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError:
+                candidate.close()
+            else:
+                lock_file = candidate
+                break
+        if lock_file is None:
+            time.sleep(0.1)
+
+    try:
+        yield
+    finally:
+        fcntl.flock(lock_file, fcntl.LOCK_UN)
+        lock_file.close()
 
 
 def _command_prefix_for_image(image: str) -> str:
@@ -77,14 +110,15 @@ class OpenSandboxWorkspace:
         self.working_dir = working_dir
         self._command_prefix = _command_prefix_for_image(image)
         self._loop = asyncio.new_event_loop()
-        self._sandbox = self._loop.run_until_complete(
-            Sandbox.create(
-                image,
-                connection_config=config,
-                timeout=timedelta(seconds=lifetime),
-                resource=_resource_for_image(image, resource_factor),
+        with _sandbox_boot_slot():
+            self._sandbox = self._loop.run_until_complete(
+                Sandbox.create(
+                    image,
+                    connection_config=config,
+                    timeout=timedelta(seconds=lifetime),
+                    resource=_resource_for_image(image, resource_factor),
+                )
             )
-        )
 
     @staticmethod
     def _join_logs(items: Any) -> str:

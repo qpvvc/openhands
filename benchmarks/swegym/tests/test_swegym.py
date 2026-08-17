@@ -14,6 +14,7 @@ from benchmarks.swegym.opensandbox_workspace import (
     OpenSandboxWorkspace,
     _command_prefix_for_image,
     _resource_for_image,
+    _sandbox_boot_slot,
 )
 from benchmarks.swegym.run_infer import (
     ConversationWallClockTimeoutError,
@@ -69,6 +70,28 @@ def test_to_builtin_types_makes_numpy_values_json_serializable() -> None:
 
     assert data == {"tests": ["a", "b"], "count": 2}
     assert json.loads(json.dumps(data)) == data
+
+
+def test_sandbox_boot_slot_rejects_non_positive_concurrency(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("SWE_BOOT_CONCURRENCY", "0")
+
+    with pytest.raises(ValueError, match="must be at least 1"):
+        with _sandbox_boot_slot():
+            pass
+
+
+def test_sandbox_boot_slot_creates_configured_lock_pool(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("SWE_BOOT_CONCURRENCY", "2")
+    monkeypatch.setenv("SWE_BOOT_LOCK_DIR", str(tmp_path))
+
+    with _sandbox_boot_slot():
+        pass
+
+    assert sorted(path.name for path in tmp_path.iterdir()) == ["slot-0"]
 
 
 def test_normalize_prepared_row_applies_sandbox_image_prefix(

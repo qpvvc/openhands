@@ -7,8 +7,9 @@ WORKSPACE_ROOT="$(cd -- "${BENCHMARKS_ROOT}/../.." && pwd)"
 
 MODEL_NAME="${MODEL_NAME:-qwen3-Coder-30B}"
 DATA_NAME="${DATA_NAME:-swe-gym}"
-NUM_SHARDS=8
+NUM_SHARDS="${NUM_SHARDS:-8}"
 NUM_WORKERS="${NUM_WORKERS:-4}"
+SWE_BOOT_CONCURRENCY="${SWE_BOOT_CONCURRENCY:-8}"
 MAX_ITERATIONS="${MAX_ITERATIONS:-100}"
 CONVERSATION_TIMEOUT="${CONVERSATION_TIMEOUT:-7200}"
 SETUP_TIMEOUT="${SETUP_TIMEOUT:-1200}"
@@ -35,7 +36,16 @@ export SANDBOX_DOMAIN="${SANDBOX_DOMAIN:-10.124.120.15:30003}"
 export SANDBOX_IMAGE_PREFIX="${SANDBOX_IMAGE_PREFIX:-10.124.120.15:30001}"
 export SCALE_SWE_IMAGE_PREFIX="${SCALE_SWE_IMAGE_PREFIX:-${SANDBOX_IMAGE_PREFIX}}"
 export UV_CACHE_DIR="${UV_CACHE_DIR:-${WORKSPACE_ROOT}/.uv-cache}"
+export SWE_BOOT_CONCURRENCY
+export SWE_BOOT_LOCK_DIR="${SWE_BOOT_LOCK_DIR:-${RUN_ROOT}/boot_locks}"
 
+for value_name in NUM_SHARDS NUM_WORKERS SWE_BOOT_CONCURRENCY; do
+  value="${!value_name}"
+  [[ "${value}" =~ ^[1-9][0-9]*$ ]] || {
+    echo "ERROR: ${value_name} must be a positive integer: ${value}" >&2
+    exit 2
+  }
+done
 [[ -x "${UV}" ]] || { echo "ERROR: uv is not executable: ${UV}" >&2; exit 2; }
 [[ -s "${DATASET}" ]] || { echo "ERROR: dataset is missing or empty: ${DATASET}" >&2; exit 2; }
 [[ -s "${SGLANG_DIR}/ready.json" ]] || { echo "ERROR: SGLang ready file is missing: ${SGLANG_DIR}/ready.json" >&2; exit 2; }
@@ -143,6 +153,23 @@ else
     echo "ERROR: expected ${dataset_rows} output rows, found ${output_rows}." >&2
     failed=1
   fi
+  unique_output_rows="$(jq -r '.instance_id' "${outputs[@]}" | sort -u | wc -l)"
+  echo "Unique output instances: ${unique_output_rows}" | tee "${RUN_ROOT}/unique_output_count.txt"
+  if [[ "${unique_output_rows}" != "${dataset_rows}" ]]; then
+    echo "ERROR: expected ${dataset_rows} unique output instances, found ${unique_output_rows}." >&2
+    failed=1
+  fi
+  abnormal_count="$(jq -s '[.[] | select(
+    .error or
+    (.test_result == null) or
+    (
+      (.test_result.grader == "scale_swe") and
+      (.test_result.resolved != true) and
+      (.test_result.grader_completed != true)
+    )
+  )] | length' "${outputs[@]}")"
+  echo "Abnormal evaluator outcomes: ${abnormal_count}" | tee "${RUN_ROOT}/infra_audit.txt"
+  [[ "${abnormal_count}" -eq 0 ]] || failed=1
   "${UV}" run swegym-score "${outputs[@]}" | tee "${RUN_ROOT}/score.txt" || failed=1
 fi
 

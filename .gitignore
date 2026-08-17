@@ -221,3 +221,4 @@ eval_outputs/
 builds/
 uv.lock
 benchmarks/swegym/hostfile
+benchmarks/swegym/.local/bin/jq
