@@ -1,7 +1,9 @@
 import asyncio
 import json
 import subprocess
+import sys
 import time
+import types
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -551,6 +553,47 @@ def test_sandbox_resources_scale_for_memory_heavy_images() -> None:
     assert _resource_for_image("registry/other:latest", 2) == {
         "cpu": "2",
         "memory": "4Gi",
+    }
+
+
+def test_opensandbox_container_gets_cleanup_owner_metadata(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    calls: list[tuple[tuple[object, ...], dict[str, object]]] = []
+
+    class FakeSandbox:
+        @classmethod
+        async def create(cls, *args: object, **kwargs: object) -> "FakeSandbox":
+            calls.append((args, kwargs))
+            return cls()
+
+        async def kill(self) -> None:
+            pass
+
+        async def close(self) -> None:
+            pass
+
+    class FakeConnectionConfig:
+        def __init__(self, **_kwargs: object) -> None:
+            pass
+
+    monkeypatch.setitem(
+        sys.modules, "opensandbox", types.SimpleNamespace(Sandbox=FakeSandbox)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "opensandbox.config",
+        types.SimpleNamespace(ConnectionConfig=FakeConnectionConfig),
+    )
+    monkeypatch.setenv("SANDBOX_API_KEY", "test-key")
+    monkeypatch.setenv("SANDBOX_CLEANUP_OWNER", "bob-evaluation-run")
+    monkeypatch.setenv("SWE_BOOT_LOCK_DIR", str(tmp_path / "locks"))
+
+    workspace = OpenSandboxWorkspace("registry/image:tag", "/workspace")
+    workspace.__exit__(None, None, None)
+
+    assert calls[0][1]["metadata"] == {
+        "docker-image-space-guard.owner": "bob-evaluation-run"
     }
 
 

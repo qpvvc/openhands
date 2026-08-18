@@ -110,6 +110,10 @@ class OpenSandboxWorkspace:
         self.working_dir = working_dir
         self._command_prefix = _command_prefix_for_image(image)
         self._loop = asyncio.new_event_loop()
+        cleanup_owner = os.getenv("SANDBOX_CLEANUP_OWNER", "")
+        cleanup_metadata = (
+            {"docker-image-space-guard.owner": cleanup_owner} if cleanup_owner else None
+        )
         with _sandbox_boot_slot():
             self._sandbox = self._loop.run_until_complete(
                 Sandbox.create(
@@ -117,6 +121,7 @@ class OpenSandboxWorkspace:
                     connection_config=config,
                     timeout=timedelta(seconds=lifetime),
                     resource=_resource_for_image(image, resource_factor),
+                    metadata=cleanup_metadata,
                 )
             )
 
