@@ -145,6 +145,31 @@ def test_normalize_scale_swe_row(monkeypatch: pytest.MonkeyPatch) -> None:
     assert data["image"] == "registry.test/aweaiteam/scaleswe:owner_repo_pr1"
 
 
+def test_normalize_swe_bench_verified_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("SANDBOX_IMAGE_PREFIX", "registry.test")
+    data = normalize_row(
+        {
+            "prompt": "fix it",
+            "label": "owner__repo-1",
+            "metadata": {
+                "_dataset_kind": "swe_bench_verified",
+                "repo": "owner/repo",
+                "version": "1.0",
+                "image": "owner/repo:instance",
+                "workdir": "/testbed",
+                "base_commit": "abc",
+                "test_patch": "diff --git a/test.py b/test.py\n",
+                "FAIL_TO_PASS": '["tests/test.py::test_fix"]',
+                "PASS_TO_PASS": "[]",
+            },
+        }
+    )
+
+    assert data["dataset_kind"] == "swe_bench_verified"
+    assert data["instance_id"] == "owner__repo-1"
+    assert data["image"] == "registry.test/owner/repo:instance"
+
+
 def test_normalize_scale_swe_does_not_treat_gold_patch_as_tests() -> None:
     with pytest.raises(ValueError, match="f2p_patch/f2p_script"):
         normalize_row(

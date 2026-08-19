@@ -6,6 +6,7 @@ import os
 import re
 import shlex
 import signal
+import tempfile
 from contextlib import contextmanager, nullcontext
 from pathlib import Path
 from typing import Any, Iterator, List
@@ -269,6 +270,33 @@ def normalize_row(row: dict[str, Any]) -> dict[str, Any]:
     else:
         data = _to_builtin_types(dict(row))
 
+    if data.get("_dataset_kind") == "swe_bench_verified":
+        image = str(data.get("image") or "")
+        image_prefix = os.getenv("SANDBOX_IMAGE_PREFIX", "").rstrip("/")
+        if image and image_prefix and not image.startswith(f"{image_prefix}/"):
+            image = f"{image_prefix}/{image.lstrip('/')}"
+        data["image"] = image
+        required = {
+            "instance_id",
+            "repo",
+            "version",
+            "image",
+            "workdir",
+            "problem_statement",
+            "base_commit",
+            "test_patch",
+            "FAIL_TO_PASS",
+            "PASS_TO_PASS",
+        }
+        missing = sorted(key for key in required if not data.get(key))
+        if missing:
+            raise ValueError(
+                "SWE-bench Verified row is missing executable metadata "
+                f"{missing}. Run prepare_swe_bench_verified.py first."
+            )
+        data["dataset_kind"] = "swe_bench_verified"
+        return data
+
     if data.get("_slime_dataset") == "scale_swe":
         image = str(data.get("image") or data.get("image_url") or "")
         prefix = (
@@ -453,7 +481,10 @@ class SWEGymEvaluation(Evaluation):
                 "failed to disable Git file-mode tracking: "
                 f"{filemode.stderr or filemode.stdout}"
             )
-        if instance.data.get("dataset_kind") != "swe_gym":
+        if instance.data.get("dataset_kind") not in {
+            "swe_gym",
+            "swe_bench_verified",
+        }:
             setup = workspace.execute_command(
                 _pre_commands_for(instance.data), timeout=self.setup_timeout
             )
@@ -638,6 +669,147 @@ class SWEGymEvaluation(Evaluation):
                 "candidate_broke_evaluator_input": candidate_broke_evaluator_input,
             }
 
+    def _evaluate_swe_bench_verified_patch(
+        self,
+        instance: EvalInstance,
+        git_patch: str,
+        agent_workspace: OpenSandboxWorkspace | None = None,
+        resource_factor: int = 1,
+    ) -> dict[str, Any]:
+        """Run and grade the official SWE-bench TestSpec inside OpenSandbox."""
+        from swebench.harness.grading import get_eval_report
+        from swebench.harness.test_spec.create_scripts import make_eval_script_list
+        from swebench.harness.test_spec.test_spec import (
+            MAP_REPO_TO_EXT,
+            MAP_REPO_VERSION_TO_SPECS,
+            TestSpec,
+        )
+
+        data = instance.data
+        workdir = str(data["workdir"])
+        evaluator_context = (
+            nullcontext(agent_workspace)
+            if agent_workspace is not None
+            else OpenSandboxWorkspace(
+                str(data["image"]),
+                workdir,
+                self.sandbox_lifetime,
+                resource_factor=resource_factor,
+            )
+        )
+        with evaluator_context as evaluator:
+            assert evaluator is not None
+            reset = evaluator.execute_command(
+                "git reset --hard "
+                f"{shlex.quote(str(data['base_commit']))} && git clean -fd",
+                timeout=min(self.setup_timeout, 60),
+            )
+            if reset.exit_code != 0:
+                return {
+                    "resolved": False,
+                    "reason": "evaluator_setup_failed",
+                    "grader": "swe_bench_verified",
+                    "setup_exit_code": reset.exit_code,
+                    "setup_stdout": reset.stdout[-4000:],
+                    "setup_stderr": reset.stderr[-4000:],
+                }
+
+            specs = MAP_REPO_VERSION_TO_SPECS[data["repo"]][data["version"]]
+            eval_script_list = make_eval_script_list(
+                data,
+                specs,
+                "testbed",
+                workdir,
+                str(data["base_commit"]),
+                str(data["test_patch"]),
+            )
+
+            def parse_test_ids(value: Any) -> list[str]:
+                if isinstance(value, str):
+                    return json.loads(value)
+                return list(value)
+
+            test_spec = TestSpec(
+                instance_id=instance.id,
+                repo=str(data["repo"]),
+                version=str(data["version"]),
+                repo_script_list=[],
+                eval_script_list=eval_script_list,
+                env_script_list=[],
+                arch="x86_64",
+                FAIL_TO_PASS=parse_test_ids(data["FAIL_TO_PASS"]),
+                PASS_TO_PASS=parse_test_ids(data["PASS_TO_PASS"]),
+                language=MAP_REPO_TO_EXT[str(data["repo"])],
+                docker_specs=specs.get("docker_specs", {}),
+                namespace=None,
+            )
+            script_path = f"{workdir}/.swe_eval/eval.sh"
+            _materialize_workspace_files(
+                evaluator, [(script_path, test_spec.eval_script)]
+            )
+            chmod = evaluator.execute_command(
+                f"chmod 755 {shlex.quote(script_path)}", timeout=30
+            )
+            if chmod.exit_code != 0:
+                return {
+                    "resolved": False,
+                    "reason": "evaluator_setup_failed",
+                    "grader": "swe_bench_verified",
+                    "setup_exit_code": chmod.exit_code,
+                    "setup_stdout": chmod.stdout[-4000:],
+                    "setup_stderr": chmod.stderr[-4000:],
+                }
+
+            _materialize_workspace_files(
+                evaluator,
+                [("/tmp/openhands_candidate.patch", _terminate_patch(git_patch))],
+            )
+            candidate_apply = evaluator.execute_command(
+                "true"
+                if not git_patch.strip()
+                else _candidate_apply_command("/tmp/openhands_candidate.patch"),
+                timeout=min(self.setup_timeout, 120),
+            )
+            if candidate_apply.exit_code != 0:
+                return {
+                    "resolved": False,
+                    "reason": "candidate_patch_apply_failed",
+                    "grader": "swe_bench_verified",
+                    "candidate_apply_exit_code": candidate_apply.exit_code,
+                    "candidate_apply_stdout": candidate_apply.stdout[-4000:],
+                    "candidate_apply_stderr": candidate_apply.stderr[-4000:],
+                }
+
+            result = evaluator.execute_command(
+                f"bash {shlex.quote(script_path)}", timeout=self.eval_timeout
+            )
+            test_output = f"{result.stdout}\n{result.stderr}"
+            with tempfile.NamedTemporaryFile(
+                mode="w", encoding="utf-8", suffix=".log"
+            ) as log:
+                log.write(test_output)
+                log.flush()
+                report = get_eval_report(
+                    test_spec=test_spec,
+                    prediction={
+                        "instance_id": instance.id,
+                        "model_name_or_path": "openhands",
+                        "model_patch": git_patch,
+                    },
+                    test_log_path=log.name,
+                    include_tests_status=True,
+                )
+            instance_report = report.get(instance.id, {})
+            return {
+                "resolved": bool(instance_report.get("resolved")),
+                "grader": "swe_bench_verified",
+                "test_report": instance_report,
+                "eval_exit_code": result.exit_code,
+                "eval_stdout": result.stdout[-4000:],
+                "eval_stderr": result.stderr[-4000:],
+                "timed_out": result.timeout_occurred,
+            }
+
     def _prepare_scale_swe_workspace(
         self, workspace: OpenSandboxWorkspace, instance: EvalInstance
     ) -> None:
@@ -795,6 +967,11 @@ class SWEGymEvaluation(Evaluation):
 
         if instance.data.get("dataset_kind") == "scale_swe":
             test_result = self._evaluate_scale_swe_patch(instance, git_patch)
+            resolved = bool(test_result["resolved"])
+        elif instance.data.get("dataset_kind") == "swe_bench_verified":
+            test_result = self._evaluate_swe_bench_verified_patch(
+                instance, git_patch, workspace
+            )
             resolved = bool(test_result["resolved"])
         else:
             test_result = self._evaluate_swe_gym_patch(instance, git_patch, workspace)
