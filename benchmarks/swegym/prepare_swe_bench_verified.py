@@ -14,6 +14,12 @@ from urllib.parse import quote
 
 import pandas as pd
 import requests
+from swebench.harness.test_spec.create_scripts import make_eval_script_list
+from swebench.harness.test_spec.test_spec import (
+    MAP_REPO_TO_EXT,
+    MAP_REPO_VERSION_TO_SPECS,
+    TestSpec,
+)
 
 
 DEFAULT_IMAGE_PREFIX = "10.124.120.15:30001/zj021/swebench"
@@ -121,6 +127,40 @@ def verify_harbor_images(image_prefix: str, image_tags: set[str]) -> None:
     )
 
 
+def _test_ids(value: Any) -> list[str]:
+    if isinstance(value, str):
+        value = json.loads(value)
+    return [str(item) for item in (value or [])]
+
+
+def _official_eval_script(metadata: dict[str, Any]) -> str:
+    """Materialize the official SWE-bench TestSpec script for Slime's evaluator."""
+    specs = MAP_REPO_VERSION_TO_SPECS[metadata["repo"]][metadata["version"]]
+    eval_script_list = make_eval_script_list(
+        metadata,
+        specs,
+        "testbed",
+        metadata["workdir"],
+        metadata["base_commit"],
+        metadata["test_patch"],
+    )
+    test_spec = TestSpec(
+        instance_id=metadata["instance_id"],
+        repo=metadata["repo"],
+        version=metadata["version"],
+        repo_script_list=[],
+        eval_script_list=eval_script_list,
+        env_script_list=[],
+        arch="x86_64",
+        FAIL_TO_PASS=_test_ids(metadata["FAIL_TO_PASS"]),
+        PASS_TO_PASS=_test_ids(metadata["PASS_TO_PASS"]),
+        language=MAP_REPO_TO_EXT[metadata["repo"]],
+        docker_specs=specs.get("docker_specs", {}),
+        namespace=None,
+    )
+    return test_spec.eval_script
+
+
 def prepare_dataset(source: Path, output: Path, image_prefix: str) -> set[str]:
     frame = pd.read_parquet(_source_parquet(source))
     missing_columns = sorted(REQUIRED_COLUMNS - set(frame.columns))
@@ -156,6 +196,7 @@ def prepare_dataset(source: Path, output: Path, image_prefix: str) -> set[str]:
                 "evaluator_pre_commands": "true",
                 "eval_cmd": "bash /testbed/.swe_eval/eval.sh",
             }
+            metadata["eval_script"] = _official_eval_script(metadata)
             output_row = {
                 "prompt": metadata["problem_statement"],
                 "label": instance_id,
