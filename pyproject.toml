@@ -14,11 +14,11 @@ dependencies = [
     "tqdm",
     "openhands-sdk",
     "openhands-tools",
-    "unidiff>=0.7.5,<0.8.0",
+    "unidiff>=0.7.5,<1.1.0",
     "openhands-agent-server",
     "openhands-workspace",
     "modal>=1.1.4",
-    "swebench==4.1.0",
+    "swebench==5.0.2",
     "commit0",
     "pytest-json-report",
     # SWT-Bench dependencies (since the git package doesn't install them properly)
